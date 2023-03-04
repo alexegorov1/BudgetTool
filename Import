@@ -1,0 +1,145 @@
+import os
+import time
+import re
+import logging
+import pandas as pd
+import mysql.connector
+from PyPDF2 import PdfFileReader
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+import finance_db
+
+
+# Get configuration variables from environment variables or config file
+FILE_PATH = os.getenv('FILE_PATH', 'C:/Budget1/Statement')
+FILE_PATTERN = os.getenv('FILE_PATTERN', 'yes')
+WAIT_TIME = int(os.getenv('WAIT_TIME', '60'))
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s',
+    handlers=[
+        logging.FileHandler('app.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# MySQL connection configuration
+DB_HOST = os.getenv('DB_HOST', 'localhost')
+DB_PORT = os.getenv('DB_PORT', '3306')
+DB_NAME = os.getenv('DB_NAME', 'finance_data')
+DB_USER = os.getenv('DB_USER', 'root')
+DB_PASSWORD = os.getenv('DB_PASSWORD', 'toor')
+
+def create_connection():
+    """
+    Creates a connection to the MySQL database.
+    """
+    conn = mysql.connector.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD
+    )
+    return conn
+
+def extract_data(file_path):
+    """
+    Extract financial data and account summary information from a PDF file.
+    Returns a tuple containing two DataFrames: financial data and account summary.
+    """
+    with open(file_path, 'rb') as f:
+        reader = PdfFileReader(f)
+        page = reader.getPage(0)
+        text = page.extractText()
+
+    # Extract financial data from the table
+    regex = r'(\d{4}-\d{2}-\d{2}).+?(?=\d{4}-\d{2}-\d{2}|Account Summary|\Z)'
+    matches = re.findall(regex, text, re.DOTALL)
+    data = []
+    for match in matches:
+        rows = match.strip().split('\n')
+        for row in rows:
+            cols = row.split()
+            if len(cols) == 5:
+                data.append(cols)
+    df = pd.DataFrame(data, columns=['date', 'description', 'category', 'amount', 'balance'])
+
+    # Extract account summary information
+    regex = r'Account Summary\s+(.+?)\s+(\d+)\s+(\d+)\s+.+?All Accounts\s+(\d+)'
+    match = re.search(regex, text, re.DOTALL)
+    if match:
+        account_name = match.group(1)
+        balance_start = match.group(2)
+        balance_end = match.group(3)
+        balance_total = match.group(4)
+        account_summary = pd.DataFrame({
+            'account_name': [account_name],
+            'balance_start': [balance_start],
+            'balance_end': [balance_end],
+            'balance_total': [balance_total]
+        })
+    else:
+        raise Exception(f'Could not extract account summary from {file_path}')
+    return df, account_summary
+def upload_data(df, account_summary):
+    """
+    Uploads the financial data and account summary to the MySQL database.
+    """
+    try:
+        # Create a connection to the database
+        conn = create_connection()
+
+        # Open a cursor to perform database operations
+        cur = conn.cursor()
+
+        # Create a new table for the financial data
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS finance_data (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                date DATE NOT NULL,
+                description TEXT NOT NULL,
+                category TEXT NOT NULL,
+                amount FLOAT NOT NULL,
+                balance FLOAT NOT NULL
+            )
+        """)
+
+        # Insert the financial data into the table
+        for _, row in df.iterrows():
+            cur.execute("""
+                INSERT INTO finance_data (date, description, category, amount, balance)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (row['date'], row['description'], row['category'], row['amount'], row['balance']))
+
+        # Create a new table for the account summary
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS account_summary (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                account_name TEXT NOT NULL,
+                balance_start FLOAT NOT NULL,
+                balance_end FLOAT NOT NULL,
+                balance_total FLOAT NOT NULL
+            )
+        """)
+
+        # Insert the account summary into the table
+        cur.execute("""
+            INSERT INTO account_summary (account_name, balance_start, balance_end, balance_total)
+            VALUES (%s, %s, %s, %s)
+        """, (account_summary['account_name'][0], account_summary['balance_start'][0],
+              account_summary['balance_end'][0], account_summary['balance_total'][0]))
+
+        # Commit the changes to the database
+        conn.commit()
+
+        # Close the database connection
+        cur.close()
+        conn.close()
+
+    except Exception as e:
+        logger.error(f"Error uploading data to MySQL: {e}")
+        raise
